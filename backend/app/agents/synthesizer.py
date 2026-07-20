@@ -80,8 +80,20 @@ import re
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import asdict, dataclass, field
+from typing import TYPE_CHECKING, Any
+
+# Imported ONLY for type-checking. A real (runtime) import of
+# :mod:`app.agents.context_agent` here would pull its four tool modules + NetworkX
+# into this module's import surface, breaking the documented stance that
+# "importing this module does NOT open a Postgres connection / pull heavy deps"
+# (the agent layer reasons over what Search already fetched, SDD 9.4 / 15).
+# ``from __future__ import annotations`` keeps the ``context_results`` annotation
+# below a *string* at runtime, so this is never evaluated; the context-block
+# builder (:func:`_format_context_block`) duck-types its inputs via
+# :func:`dataclasses.asdict` instead of ``isinstance`` against this type.
+if TYPE_CHECKING:
+    from app.agents.context_agent import ContextStepResult
 
 from app.agents.planner import (  # public: shared infra-error + connection config
     DEFAULT_TIMEOUT,
@@ -128,6 +140,30 @@ DEFAULT_MAX_HITS = 40
 # rambling model. Under think=False this budget is entirely answer (no CoT), so
 # budget-exhaustion-to-empty (the Planner's root-cause failure) stays off.
 DEFAULT_MAX_TOKENS = 700
+
+# Context-results bounds (SDD 9.3 results the Search Agent cannot produce:
+# architecture centrality / dependency closures / file history / GitHub metadata).
+# These are rendered RAW via ``dataclasses.asdict`` and capped here, because the
+# four context tool result dataclasses (SDD 10) can carry NetworkX slices or
+# repo-wide tables that would otherwise swamp the prompt. Capping the *rendered*
+# prose is safe for grounding: the citable fact for a context result is
+# structural ("key files are X/Y/Z", "module M imports N"), not the full dump,
+# and -- per the SDD 9.4 grounding rule -- the only paths the model is permitted
+# to cite are still the SEARCH hits (the context block is explicitly labeled
+# "cite with care"; context paths are NOT added to the grounding set, see
+# :func:`_format_hits`). When the cap bites it is surfaced in the block (the
+# same "no silent caps" posture as the indexing stages' dropped-count reports).
+
+# How many context results are rendered into the prompt. Context results are
+# heavier than search hits (structured dumps, not one-line citations), so this
+# is tighter than :data:`DEFAULT_MAX_HITS`.
+DEFAULT_MAX_CONTEXT = 6
+
+# Per-context-result rendered-text cap. Architecture's key-files list or
+# dependency_graph's forward/backward closures can be long; truncating the
+# compact-JSON dump to this many chars keeps one ballooning result from eating
+# the prompt -- same role as :data:`DOCSTRING_CAP` / :data:`MATCHED_TEXT_CAP`.
+CONTEXT_RESULT_CAP = 600
 
 
 # The system prompt: the grounding instruction is the crux of SDD 9.4 ("cite
@@ -360,6 +396,120 @@ def _format_hits(
     return "\n".join(parts), ground
 
 
+# ─── context block (SDD 9.3 results, the "cite with care" second block) ───────
+# Consumes ``ContextStepResult`` objects (one per executed context plan step -- the
+# structural twin of SearchStepResult but for the four context tools, SDD 9.3),
+# each wrapping a different SDD 10 result dataclass
+# (:class:`ArchitectureResult` / :class:`DependencyGraphResult` /
+# :class:`FileHistoryResult` / :class:`GitHubMetadataResult`). Unlike the
+# search-hit builders above, the Synthesizer does NOT try to format each of the
+# four context results with bespoke per-tool citation rules -- it renders them
+# RAW via ``dataclasses.asdict`` under one clearly-labeled "cite with care"
+# header, and does NOT add their paths to the grounding set.
+#
+# Why the asymmetry (search hits are citable; context results are "cite with
+# care", not added to "Allowed citation paths"):
+# * The search hits are the SDD 9.4 grounding basis by *construction* -- they are
+#   the model's source of named paths/lines (each hit was a match to the user's
+#   query, surfaced by a search tool). The context block is *additional
+#   contextual signal* (the key-files centrality, the import
+#   closures, the file history, the GitHub metadata) -- a path that appears in
+#   e.g. architecture's "key files" is NOT itself a citation the grounding rule
+#   permits, because the search tools never vouched for it as a match to the
+#   user's query; the model quoting it would be claiming a fact the search step
+#   didn't surface. So context paths stay off the grounding set, and the model
+#   is told (in the header) to use the context only to interpret or frame the
+#   search hits, not to invent citations from it.
+# * Bespoke per-tool rendering (architecture centrality vs. dependency closures
+#   vs. file history vs. GitHub metadata) is real engineering -- and OUT OF SCOPE
+#   today, because the Planner's context menu is not yet wired (CLAUDE.md), so
+#   ``context_results`` is empty in every current execution path (the demo's 3
+#   questions are all search-tool questions; the Context Agent is exercised by
+#   hand-constructed steps in its own tests/demo). When the menu lands AND this
+#   minimal renderer is exercised live, a follow-up can specialize the per-tool
+#   rendering then -- guided by real model behavior, exactly the way every other
+#   prompt decision in this stack was tuned (the same "verify, don't guess"
+#   posture the CLAUDE.md known-limitation note codifies). This helper is the
+#   narrow additive seam that follow-up plugs into.
+
+
+def _format_context_block(
+    context_results: list[ContextStepResult] | None,
+    *,
+    max_context: int,
+) -> str:
+    """Build the additional "Context results" block appended to the user message;
+    return ``""`` when there is nothing to render (kept by the caller as the
+    no-op branch -- a ``""`` context block means the user message is byte-
+    identical to today's search-only prompt, so the 11 verified demo/diagnostic
+    runs are preserved whenever no context steps ran).
+
+    Each rendered context result is one labeled bullet: the tool name, the
+    args actually used (so the model sees what the context query was), and the
+    tool's structured result dumped via :func:`dataclasses.asdict` as compact
+    JSON. ``ContextStepResult.result`` carries one of the four SDD 10 context
+    result dataclasses (plain fields / dataclasses of plain fields all the way
+    down), so ``asdict`` + ``json.dumps`` is total (no opaque NetworkX or ORM
+    object escapes -- the context tools serialize their own graph slices into
+    lists of dicts/edges). CRLF in any str field is folded to LF
+    (:func:`_normalize_newlines`) at the boundary where text *enters* agent
+    context, the same fix the search-hit fields get -- so a Windows repo's
+    commit subject or an architecture label can't put a raw ``\\r`` in front of
+    the model.
+
+    Two caps (both surfaced, never silent -- the project's "no silent caps"
+    posture): ``max_context`` truncates the *number* of results rendered (the
+    order is preserved; the dropped tail is named by the NOTE banner so it is
+    visible, not swallowed), and :data:`CONTEXT_RESULT_CAP` truncates each
+    per-result dump with an ellipsis so one ballooning architecture/dependency
+    result can't eat the prompt's budget.
+    """
+    if not context_results:
+        return ""
+
+    # Normal newline-fold every str-valued field so no raw carriage return reaches
+    # the prompt (the context tools' results can carry a repo-relative path /
+    # commit subject / issue title sourced from disk or the GitHub API; same CRLF
+    # boundary-fix the search-hit fields get). Mutates the asdict copy, not the
+    # caller's dataclasses (``asdict`` returns fresh plain dicts/lists).
+    def _fold_strs(obj: Any) -> Any:
+        if isinstance(obj, str):
+            return _normalize_newlines(obj)
+        if isinstance(obj, list):
+            return [_fold_strs(x) for x in obj]
+        if isinstance(obj, dict):
+            return {k: _fold_strs(v) for k, v in obj.items()}
+        return obj
+
+    parts: list[str] = [
+        "## Context results (CONTEXTUAL only -- NOT additional citation grounds; "
+        "the citable paths remain the search-hit paths above. Use these to "
+        "understand the repo's shape/structure/history, and to FRAME or interpret "
+        "the search hits; do not invent a file/line citation that did not appear "
+        "in the search hits block.)"
+    ]
+    n_dropped = max(0, len(context_results) - max_context)
+    for r in context_results[:max_context]:
+        try:
+            dumped = json.dumps(_fold_strs(asdict(r.result)), ensure_ascii=False)
+        except (TypeError, ValueError):
+            # A context result that is not ``asdict``-able (a future tool returning
+            # a non-dataclass, or a field holding an unpicklable object) is shown
+            # raw rather than crashing synthesis -- the demo must never die on one
+            # bad context result. The block still renders; this result is labeled
+            # "(unserializable, shown raw)" so it's visible, not swallowed.
+            dumped = repr(r.result)
+        if len(dumped) > CONTEXT_RESULT_CAP:
+            dumped = dumped[:CONTEXT_RESULT_CAP] + " …"
+        parts.append(f"- {r.tool} (args={json.dumps(r.args, ensure_ascii=False)}) -> {dumped}")
+    if n_dropped:
+        parts.append(
+            f"((NOTE: {len(context_results)} context results were returned in "
+            f"total; only the first {max_context} are listed here.))"
+        )
+    return "\n".join(parts)
+
+
 # ─── citation extraction from the answer (a heuristic, clearly labeled) ─────
 # A run of path-legal characters ([A-Za-z0-9_./-]); backticks / parens / colons
 # are NOT in the class, so a citation like `src/flask/app.py:42` is matched as
@@ -434,6 +584,7 @@ def _chat_payload(
     temperature: float,
     max_tokens: int,
     think: bool = False,
+    context_block: str = "",
 ) -> dict[str, Any]:
     """Build the JSON body for Ollama ``POST /api/chat``. Pure (no I/O), split out
     so it can be inspected without a network call (mirrors
@@ -441,10 +592,34 @@ def _chat_payload(
     is NO ``format`` key -- the output is prose (see module docstring) -- and the
     user message carries the hits block (the Planner's carries a tool catalog).
 
+    ``context_block`` (default ``""``) is the additional "Context results"
+    block :func:`_format_context_block` produces from the executed context plan
+    steps (SDD 9.3). When empty or all-whitespace (the common case today: the
+    Planner's context menu is not yet wired, so context_results is empty for
+    every current execution path) the user message is **byte-identical** to the
+    pre-context search-only prompt -- so :mod:`scripts.inspect_q1_prompt` and the
+    11 verified demo/diagnostic runs are preserved unchanged. When non-empty the
+    context block is appended between the hits block and the question, clearly
+    labeled "CONTEXTUAL only; not additional citation grounds" (see
+    :func:`_format_context_block`).
+
     ``think`` maps to the top-level Ollama ``/api/chat`` ``think`` param; ``False``
     (the default) disables chain-of-thought (see module docstring for the
     budget-exhaustion rationale). Top-level, NOT under ``options``.
     """
+    user_content = f"Search hits:\n{hits_block}\n\nUser question:\n{question}"
+    if context_block and context_block.strip():
+        # The context block is sandwiched between the hits (the grounding basis)
+        # and the question (what the model must answer) so it reads like extra
+        # signal about the repo's shape/structure/history that frames the hits,
+        # not a competing set of citable paths. Its own header carries the
+        # "cite with care" instruction; the system prompt's grounding rule
+        # (only "Allowed citation paths" are real) is untouched, and the context
+        # block is NOT added to that grounding set.
+        user_content = (
+            f"Search hits:\n{hits_block}\n\nContext results:\n{context_block}\n"
+            f"\nUser question:\n{question}"
+        )
     body: dict[str, Any] = {
         "model": model,
         "stream": False,
@@ -454,10 +629,7 @@ def _chat_payload(
         "options": {"temperature": temperature, "num_predict": max_tokens},
         "messages": [
             {"role": "system", "content": SYNTHESIZER_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": f"Search hits:\n{hits_block}\n\nUser question:\n{question}",
-            },
+            {"role": "user", "content": user_content},
         ],
     }
     return body
@@ -534,11 +706,15 @@ def synthesize(
     temperature: float = 0.0,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     max_hits: int = DEFAULT_MAX_HITS,
+    context_results: list[ContextStepResult] | None = None,
+    max_context: int = DEFAULT_MAX_CONTEXT,
     timeout: float = DEFAULT_TIMEOUT,
 ) -> SynthesizerResult:
     """Produce the final user-facing answer to ``question`` from the structured
     search hits in ``results`` (one :class:`SearchStepResult` per executed plan
-    step -- SDD 9.2 -> 9.4), via one Ollama ``/api/chat`` call.
+    step -- SDD 9.2 -> 9.4), plus the optional context results in
+    ``context_results`` (one :class:`ContextStepResult` per executed context plan
+    step -- SDD 9.3 -> 9.4), via one Ollama ``/api/chat`` call.
 
     Defaults mirror the Planner's lessons: ``think=False`` (chain-of-thought off
     so the answer isn't budget-exhausted to empty -- see module docstring),
@@ -552,7 +728,20 @@ def synthesize(
     ``max_hits`` caps how many hits are rendered into the prompt (the search tools
     bound themselves, but ``search_symbols`` / ``search_files`` are repo-scale-
     bounded); when the cap bites it is surfaced in the hits block, not applied
-    silently.
+    silently. ``max_context`` is the twin cap for the context block (see
+    :func:`_format_context_block`); when ``context_results`` is ``None`` or empty
+    -- the common case today, because the Planner's context menu is not yet wired
+    -- the context block is the empty string and the user message is byte-identical
+    to the pre-context search-only prompt.
+
+    **Grounding posture is unchanged by context_results.** The model is permitted
+    to cite ONLY the search-hit paths (in ``SynthesizerResult.hit_file_paths``);
+    the context block is rendered under a "CONTEXTUAL only; NOT additional
+    citation grounds" header and its paths are deliberately NOT added to the
+    grounding set, so a path that appears in (e.g.) architecture's key-files list
+    cannot become a citation the search step never vouched for. (Bespoke per-tool
+    context rendering is a deferred follow-up, exercised only once the Planner's
+    context menu lights up -- see :func:`_format_context_block`.)
 
     An empty ``results`` (or all-empty hits) is a *valid* input (SDD 10: an empty
     result is a valid answer): the LLM is still called -- the system prompt tells
@@ -566,6 +755,7 @@ def synthesize(
     one ``except`` covers both stages.
     """
     hits_block, ground = _format_hits(results, max_hits=max_hits)
+    context_block = _format_context_block(context_results, max_context=max_context)
     payload = _chat_payload(
         question,
         hits_block,
@@ -573,6 +763,7 @@ def synthesize(
         temperature=temperature,
         max_tokens=max_tokens,
         think=think,
+        context_block=context_block,
     )
     start = time.perf_counter()
     raw = _ollama_chat(payload, host=host, timeout=timeout)
@@ -590,6 +781,8 @@ def synthesize(
 
 
 __all__ = [
+    "CONTEXT_RESULT_CAP",
+    "DEFAULT_MAX_CONTEXT",
     "SynthesizerResult",
     "synthesize",
 ]
