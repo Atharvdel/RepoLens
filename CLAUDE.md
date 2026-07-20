@@ -42,8 +42,7 @@ bootstrap `sys.path` themselves (see `tests/conftest.py`), so either set
   cross-checked against `src/flask/app.py`, confirmed correct. **Known limitation
   (§18):** PEP 420 namespace packages (dirs with no `__init__.py`) are not honored
   by the absolute resolver; flagging rather than guessing is the mandated posture.
-- **Reference index — `app/indexing/reference_index.py`: done; flask batch run
-  pending verification (blocked by the Bash classifier outage → user runs).**
+- **Reference index — `app/indexing/reference_index.py`: done, verified.**
   `find_references` (pure wrt DB — shells out to `ripgrep` for a symbol's
   whole-word name across the repo's `.py` files, drops the symbol's own
   `def`/`class` binding line, caps at `DEFAULT_CAP=50` via `--max-count`) →
@@ -56,6 +55,11 @@ bootstrap `sys.path` themselves (see `tests/conftest.py`), so either set
   comments/string literals are NOT filtered (documented trade-off — reliable
   filtering needs a tokenizer, same "flag rather than guess" posture as the
   import graph's PEP 420 note). Tests: `tests/test_reference_index.py`.
+  **Verified:** a DB probe confirms 2381 `references` edges + 467 `imports` edges
+  for flask — matching the earlier `index_all_flask_references.py` batch-run
+  reports + the manual `Blueprint` symbol reference spot-checks. The "pending
+  verification" caveat (held open only by the Bash-classifier-outage handoff,
+  never by an actual open question) is now lifted.
 
 ## Agent layer (SDD §9)
 
@@ -225,6 +229,60 @@ bootstrap `sys.path` themselves (see `tests/conftest.py`), so either set
   are already correct; only the empty lists populate (the pinned clear-empty tests
   will then fail-by-design, prompting their one-line update).
 
+## LangGraph orchestration (SDD §15)
+
+- **LangGraph wiring — `app/agents/graph.py`: done, verified (commit d29e40e).**
+  The connective tissue over the four standalone §9 agents — owns no agent logic
+  of its own; wraps each as a LangGraph node and wires the SDD §15 edge topology:
+  `Planner -> (Search | Context, run sequentially, a branch skipped entirely when
+  the plan has no steps for it) -> Synthesizer`, with one replan loop ("retry once
+  if Search returns zero hits") bounded at 1 via `replans_used` (bumped on planner
+  re-entry, detected by `plan is not None`; gated on `had_search` so context-only
+  / empty plans never loop). Four PURE module-level routing functions
+  (`_needs_replan` / `_replan_target` / `_route_after_planner` /
+  `_route_after_search`) read state alone (no I/O, no closures, no infra) so the
+  decision matrix is unit-testable with no LLM/DB/ripgrep. `RepoLensState` carries
+  the six SDD §15 control fields verbatim (`{query, plan, search_results,
+  context_results, replans_used, final_answer}`) + clearly-labeled observability;
+  `node_trace` + `errors` are the only accumulating (`operator.add`) channels,
+  everything else is last-write-wins so a replan's second pass cleanly OVERWRITES
+  the zero-hit first pass's evidence. `run_query(question, repository_id,
+  session) -> GraphResult` is the single top-level entrypoint — caller owns the
+  `Session` (§15 "one session per query"); `GraphResult` wraps the final state so
+  the caller never touches a raw LangGraph dict. Built+compiled per call (closures
+  inject `repository_id`/`session`/`host`/`model`); stateless across calls; no
+  checkpointer (pure-read tools, replan cap ⇒ ≤~10 supersteps, under LangGraph's
+  default recursion limit).
+- **Synthesizer `context_results` seam — `app/agents/synthesizer.py`: done.** The
+  minimal additive change that lets the Synthesizer consume §9.3 results too.
+  `synthesize()` gains `context_results: list[ContextStepResult] | None = None`
+  (+ `max_context`), defaulted so the search-only path is unchanged. New
+  `_format_context_block` renders §9.3 results RAW via `dataclasses.asdict` under
+  a "CONTEXTUAL only; NOT additional citation grounds" header, with two
+  surfaced-never-silent caps (`DEFAULT_MAX_CONTEXT=6` results,
+  `CONTEXT_RESULT_CAP=600` chars/result). **Grounding posture unchanged by
+  context:** context paths stay OFF the grounding set — only search-hit paths
+  remain citable. None/empty → `context_block=""` → the user message is
+  byte-identical to the pre-context search-only prompt (the 11 prior verified
+  demo/diagnostic runs preserved). `ContextStepResult` imported under
+  `TYPE_CHECKING` only — no runtime NetworkX / `context_agent` pull (preserves the
+  "importing this module opens no Postgres / no heavy deps" stance).
+- **Demo + tests — `scripts/langgraph_demo.py`, `scripts/run_graph_tests.py`,
+  `tests/test_graph.py`: done.** The demo runs the same 3 flask questions as the
+  chain demos through `run_query` — the first time the actual §15 graph executes
+  end-to-end — printing the `node_trace`, plan shape, per-tool hit counts,
+  `replans_used`, the cited answer, + a ground-vs-cited eyeball aid. The test
+  suite (18 tests): the pure routing decision matrix (pinned across the
+  `replans_used`/`had_search`/`total_hits`/`had_context` Cartesian product),
+  structure-valid (`build_graph` compiles + carries the four agent nodes),
+  `_format_context_block` (empty → `""`, header text, both caps), + one live
+  `test_run_query_live_flask` that self-skips without Ollama/flask.
+  `run_graph_tests.py` is the throwaway pytest runner for the Bash-classifier
+  outage. **Verified: 24/25 with services up** (the 1 skip is an
+  Ollama-reachability-probe timing, immediately disproven by the live demo); the
+  demo runs 3/3 answered, 0 friction, 0 invented citations, with correct node
+  routing including the search→context→synth topology and the bounded replan loop.
+
 ## Test repo
 
 - **flask**, cloned at `C:\Users\Atharv Sharma\Desktop\Work\flask`.
@@ -300,12 +358,17 @@ directly in PowerShell** (or via the `!` prompt prefix), and paste the output ba
 
 ## Next up
 
-- **All four §9 agents are now built standalone (pre-LangGraph): Planner (§9.1),
-  Search Agent (§9.2), Context Agent (§9.3), Synthesizer (§9.4).** The
-  Planner→Search chain is proven (3/3 clean); the Context Agent is now verified
-  clean-green end-to-end (74/74, incl. live flask dispatch) — only its two
-  follow-ups remain (Planner context-menu wiring; §7 step 7+8 backing);
-  Synthesizer was already verified. The next
+- **The four §9 agents are built AND wired into the §15 graph (commit d29e40e):
+  Planner (§9.1), Search Agent (§9.2), Context Agent (§9.3), Synthesizer (§9.4),
+  connected by `app/agents/graph.py`.** The Planner→Search chain is proven (3/3
+  clean); the Context Agent is verified clean-green end-to-end (74/74, incl. live
+  flask dispatch); the Synthesizer was verified standalone; and the §15 LangGraph
+  wiring is verified (test suite 24/25 with services up — the 1 skip is an
+  Ollama-reachability-probe timing, immediately disproven by the live demo; the
+  `langgraph_demo` runs 3/3 answered, 0 friction, 0 invented citations, with
+  correct node routing — `planner -> search -> context -> synthesizer` when the
+  plan has context steps, the bounded one-replan loop when Search returns zero
+  hits). See the "LangGraph orchestration (SDD §15)" section below. The remaining
   discrete steps, in rough order:
   - **Wire the Planner's context menu** (the Context Agent follow-up above) —
     teach the verified Planner to EMIT `agent:"context"` steps (new
@@ -313,17 +376,11 @@ directly in PowerShell** (or via the `!` prompt prefix), and paste the output ba
     `OPTIONAL_TOOL_ARGS` entries, reconcile the SDD §9.1 `"file"` arg-name to
     the tools' `"target"`), re-run the 5-question demo for its own Ollama
     re-verification. Then a `planner_context_chain_demo.py` mirroring
-    `planner_search_chain_demo.py` proves the §9.1→§9.3 hop on real steps.
-  - **Wire the full LangGraph orchestration (SDD §15)** — the §9.1 Planner picks
-    search OR context steps, the §9.2/§9.3 dispatchers execute them, the §9.4
-    Synthesizer consumes both `*StepResult` shapes into one cited NL answer. The
-    four agents are the nodes; this is the connective tissue + persistence
-    (`chat_messages.tool_trace`, SDD §11).
-- **Verify the reference index against flask.** Run
-  `scripts/index_all_flask_references.py` (blocked by the Bash classifier
-  outage → user runs it) and confirm its report, then lift the "pending
-  verification" caveat in the reference-index pipeline-status bullet above.
-- **Then git history + GitHub metadata (SDD §7 later steps) — now also the backing
+    `planner_search_chain_demo.py` proves the §9.1→§9.3 hop on real steps. Until
+    this lands the §15 graph's context branch is exercised only by
+    hand-constructed steps in tests (the live demo's 3 questions are all
+    search-tool questions, so the graph runs `planner -> search -> synthesizer`).
+- **Git history + GitHub metadata (SDD §7 later steps) — now also the backing
   for the Context Agent's two metadata tools.** The core indexing stages — walker,
   parser, import graph, reference index — are all in place; the remaining §7 steps
   add commit/author/blame history (step 7 → `file_history`'s lists) and repo
