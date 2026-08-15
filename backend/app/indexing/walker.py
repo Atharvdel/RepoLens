@@ -45,8 +45,9 @@ PRUNED_DIRS: frozenset[str] = frozenset(
         "venv", ".venv", "env", ".env",
         # Node dependency / asset dirs.
         "node_modules", "bower_components", "jspm_packages",
-        # Build / packaging output.
-        "build", "dist", "_build", "out", "target",
+        # Build / packaging output & frontend framework build output.
+        "build", "dist", "_build", "out", "target", ".output",
+        ".next", ".nuxt", ".svelte-kit", ".turbo", ".vercel", ".cache",
         ".eggs", "eggs",
         # Coverage / type-check / lint caches & tmps.
         ".mypy_cache", ".ruff_cache", ".pytest_cache", ".tox", ".nox",
@@ -61,10 +62,15 @@ PRUNED_DIRS: frozenset[str] = frozenset(
 # blobs that balloon a repo are the usual reason this trips.
 MAX_FILE_SIZE_BYTES: int = 1 * 1024 * 1024
 
-# Extension → RepoLens language slug, for the languages in MVP scope (SDD §0).
-# Add ``.ts``, ``.tsx``, ``.js``, ``.jsx`` here when JS/TS indexing lands.
+# Extension -> RepoLens language slug, for the languages in MVP scope (SDD §0).
 INDEXED_EXTENSIONS: dict[str, str] = {
     ".py": "python",
+    ".ts": "typescript",
+    ".tsx": "typescript",
+    ".js": "javascript",
+    ".jsx": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
 }
 
 

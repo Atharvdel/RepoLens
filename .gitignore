@@ -32,6 +32,13 @@ pnpm-debug.log*
 .env.local
 .env.*.local
 
+# ─── Data & DB ───────────────────────────────────────────────────────────────
+data/
+backend/data/
+*.db
+*.sqlite
+*.sqlite3
+
 # ─── Docker ──────────────────────────────────────────────────────────────────
 postgres_data/
 
@@ -43,3 +50,7 @@ desktop.ini
 # ─── Editors / IDEs ──────────────────────────────────────────────────────────
 .idea/
 .vscode/
+
+# ─── Scratch / Temporary ──────────────────────────────────────────────────────
+backend/scripts/resume_test_out.txt
+backend/scripts/resume_status_check.ps1

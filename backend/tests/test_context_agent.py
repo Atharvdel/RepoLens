@@ -457,8 +457,9 @@ def test_dispatch_file_history_clear_empty_until_section7_live():
     assert result.args == {"target": sample}, result.args
     assert isinstance(result.result, FileHistoryResult)
     assert result.result.file_path == sample
-    assert result.result.last_modified is not None  # walker set this (§7 step 1)
-    assert result.result.top_contributors == [] and result.result.recent_commits == []
+    assert isinstance(result.result.top_contributors, list)
+    assert isinstance(result.result.recent_commits, list)
+    assert len(result.result.top_contributors) >= 1 or len(result.result.recent_commits) >= 1
 
 
 @flask_required

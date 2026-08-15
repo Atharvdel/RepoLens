@@ -273,6 +273,12 @@ class GraphResult:
         graph with ``final_answer=None``)."""
         return bool(self.final_answer and self.final_answer.strip())
 
+    @property
+    def answer(self) -> str:
+        """Convenience alias for final_answer or empty string."""
+        return self.final_answer or ""
+
+
 
 # ─── live wrapper: build_graph + the four node closures ──────────────────────
 
@@ -281,9 +287,11 @@ def build_graph(
     repository_id: int,
     session: Session,
     *,
-    host: str = OLLAMA_HOST,
-    model: str = OLLAMA_MODEL,
+    host: str | None = None,
+    model: str | None = None,
 ):
+    host = host or OLLAMA_HOST
+    model = model or OLLAMA_MODEL
     """Build + compile the §15 graph with the four agent nodes wired, closing
     over the orchestrator-supplied ``repository_id`` + ``Session`` + Ollama
     ``host``/``model`` (the same injected infra the two dispatchers take). The
@@ -552,9 +560,11 @@ def run_query(
     repository_id: int,
     session: Session,
     *,
-    host: str = OLLAMA_HOST,
-    model: str = OLLAMA_MODEL,
+    host: str | None = None,
+    model: str | None = None,
 ) -> GraphResult:
+    host = host or OLLAMA_HOST
+    model = model or OLLAMA_MODEL
     """Run one user question through the full §15 graph and return the answer +
     the full state, callable without knowing anything about LangGraph internals.
 

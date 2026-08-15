@@ -258,7 +258,16 @@ def find_text(
         "--line-number",
         "--no-heading",
         "--color", "never",
-        "--type", "py",
+        "-i",  # case-insensitive search
+        "-g", "*.py",
+        "-g", "*.ts",
+        "-g", "*.tsx",
+        "-g", "*.js",
+        "-g", "*.jsx",
+        "-g", "*.json",
+        "-g", "*.md",
+        "-g", "*.yaml",
+        "-g", "*.yml",
     ]
     if not regex:
         args.append("--fixed-strings")
@@ -341,39 +350,18 @@ def search_text(
     treats it as match-everything, which with ``--fixed-strings`` is an error â€”
     surfaced as ``RuntimeError`` rather than swallowed).
     """
+    from app.tools._path_resolve import resolve_repo_root
+
     repo = session.get(Repository, repository_id)
     if repo is None:
-        return []  # unknown repo id â†’ no indexed text to search (sibling-consistent)
+        return []
 
-    repo_root = repo.url_or_path
+    repo_root = resolve_repo_root(repo, session)
     if not repo_root or not Path(repo_root).is_dir():
         raise FileNotFoundError(
             f"repository {repository_id!r} repo_root is not a usable directory: "
-            f"{repo_root!r} (url_or_path must be a local path the repo was "
-            f"cloned/added from; got {repo_root!r})"
+            f"{repo.url_or_path!r} (local path or managed clone not found)"
         )
-
-    # Confirm the candidate root against the files table's stored *relative*
-    # paths: an indexed file must resolve on disk under this root. Catches a repo
-    # moved after indexing or a stale url_or_path â€” both would otherwise let
-    # ripgrep run against the wrong / empty tree and silently return [].
-    sample_path = session.execute(
-        sa.select(File.path)
-        .where(File.repository_id == repository_id)
-        .order_by(File.path)
-        .limit(1)
-    ).scalar()
-    if sample_path is not None:
-        probe = Path(repo_root) / sample_path
-        if not probe.exists():
-            raise RuntimeError(
-                f"repository {repository_id!r} repo_root {repo_root!r} does not "
-                f"contain indexed file {sample_path!r} (looked for {probe!r}); "
-                f"the repository may have moved since indexing â€” re-index or "
-                f"update url_or_path."
-            )
-    # else: no files indexed for this repo â†’ nothing to search; fall through to
-    # find_text, which returns [] (ripgrep finds nothing under the empty tree).
 
     return find_text(
         query,

@@ -45,12 +45,47 @@ query time. Honoring PEP 420 namespace dirs (``sansio/`` has no ``__init__.py``)
 the way the import resolver does is out of scope at the tool layer — flagging
 rather than guessing, as documented there.
 """
-from __future__ import annotations
+import os
+import re
+from pathlib import Path
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
-from app.models import File
+from app.models import File, Repository
+
+# Base directory where remote repositories are cloned locally
+MANAGED_REPOS_DIR = Path(os.getenv("MANAGED_REPOS_DIR", "data/repos"))
+
+
+def resolve_repo_root(repository: Repository | int, session: Session) -> Path | None:
+    """Resolve the local on-disk directory root for a repository (local path or cloned GitHub repo)."""
+    if isinstance(repository, int):
+        repo = session.get(Repository, repository)
+    else:
+        repo = repository
+    if not repo:
+        return None
+
+    # 1. If url_or_path is an existing local directory, return it
+    if repo.url_or_path:
+        local_p = Path(repo.url_or_path)
+        if local_p.is_dir():
+            return local_p
+
+    # 2. If it's a managed/cloned repository in data/repos
+    safe_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", repo.name or "")
+    managed_dir = MANAGED_REPOS_DIR / f"{repo.id}_{safe_name}"
+    if managed_dir.is_dir():
+        return managed_dir
+
+    # 3. Search MANAGED_REPOS_DIR for prefix "{repo.id}_"
+    if MANAGED_REPOS_DIR.is_dir():
+        for p in MANAGED_REPOS_DIR.iterdir():
+            if p.is_dir() and p.name.startswith(f"{repo.id}_"):
+                return p
+
+    return None
 
 # Escape char for the LIKE/ILIKE patterns emitted below — matches the twin in
 # :mod:`app.tools.symbol_search` / :mod:`app.tools.file_search`. Escaping LIKE

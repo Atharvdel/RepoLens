@@ -139,57 +139,34 @@ DEFAULT_MAX_HITS = 40
 # 700 leaves comfortable room for a cited answer while still bounding a
 # rambling model. Under think=False this budget is entirely answer (no CoT), so
 # budget-exhaustion-to-empty (the Planner's root-cause failure) stays off.
-DEFAULT_MAX_TOKENS = 700
+DEFAULT_MAX_TOKENS = 1500
 
 # Context-results bounds (SDD 9.3 results the Search Agent cannot produce:
 # architecture centrality / dependency closures / file history / GitHub metadata).
-# These are rendered RAW via ``dataclasses.asdict`` and capped here, because the
-# four context tool result dataclasses (SDD 10) can carry NetworkX slices or
-# repo-wide tables that would otherwise swamp the prompt. Capping the *rendered*
-# prose is safe for grounding: the citable fact for a context result is
-# structural ("key files are X/Y/Z", "module M imports N"), not the full dump,
-# and -- per the SDD 9.4 grounding rule -- the only paths the model is permitted
-# to cite are still the SEARCH hits (the context block is explicitly labeled
-# "cite with care"; context paths are NOT added to the grounding set, see
-# :func:`_format_hits`). When the cap bites it is surfaced in the block (the
-# same "no silent caps" posture as the indexing stages' dropped-count reports).
+DEFAULT_MAX_CONTEXT = 8
 
-# How many context results are rendered into the prompt. Context results are
-# heavier than search hits (structured dumps, not one-line citations), so this
-# is tighter than :data:`DEFAULT_MAX_HITS`.
-DEFAULT_MAX_CONTEXT = 6
-
-# Per-context-result rendered-text cap. Architecture's key-files list or
-# dependency_graph's forward/backward closures can be long; truncating the
-# compact-JSON dump to this many chars keeps one ballooning result from eating
-# the prompt -- same role as :data:`DOCSTRING_CAP` / :data:`MATCHED_TEXT_CAP`.
-CONTEXT_RESULT_CAP = 600
+# Per-context-result rendered-text cap. Roomy so README documentation and
+# code implementation snippets are not truncated.
+CONTEXT_RESULT_CAP = 4000
 
 
-# The system prompt: the grounding instruction is the crux of SDD 9.4 ("cite
-# only facts present in its structured inputs"). Stated once, globally; the
-# per-section headers in the hits block reinforce it for each hit type (symbol/
-# text hits carry line numbers -> cite `path:line`; file hits have NO line ->
-# cite the path alone, never an invented line).
-#
-# One same-name coverage rule was TRIED here and REVERTED (see CLAUDE.md,
-# "Known limitation (Synthesizer)"): at temperature=0 / qwen3:8b, asking the
-# model to cite ALL hits sharing an exact symbol name does nothing -- 0/5 via
-# scripts/synth_q1_repeat.py -- so it was confirmed dead guidance at the only
-# config we run and removed (token weight + a narrow bullet that looks
-# load-bearing but isn't). The finding is preserved in CLAUDE.md, not as a
-# dormant prompt instruction. Do NOT re-add a same-name rule without changing
-# the lever (temperature / model / two-pass); prompt wording is not it.
-SYNTHESIZER_SYSTEM_PROMPT = """You are the Synthesizer for RepoLens, a tool that helps people understand an unfamiliar codebase. You are the ONLY agent that writes user-facing prose. You are given the user's original question and the structured search hits that were retrieved from the indexed repository by the search tools. Your job is to write a clear, concise natural-language answer that is GROUNDED ONLY in those hits.
+# The system prompt: guides the model to produce detailed, grounded architectural,
+# functional, and data flow explanations.
+SYNTHESIZER_SYSTEM_PROMPT = """You are the Senior Code Intelligence Synthesizer for RepoLens. You analyze codebases and provide detailed, technical, step-by-step explanations based ONLY on the provided repository documentation, package configurations, route handlers, and source code excerpts.
 
-Citation rules -- the core of your job:
-- Cite files and line numbers ONLY from the hits provided. NEVER invent a file path, line number, symbol name, or code that does not appear in the hits.
-- For symbol hits and text hits (which carry line numbers), cite as `path/to/file.py:line` or `path/to/file.py:start-end`.
-- For file hits (which have NO line number), cite the path alone -- `path/to/file.py` -- and do NOT attach a line number to them.
-- Prefer inline citations right next to the claim they support.
-- Only the paths listed under "Allowed citation paths" are real; any path you cite must be one of them.
-
-If the hits are empty or do not answer the question, say so plainly ("the indexed repository did not contain anything matching that") rather than guessing or padding. Do not mention the search tools, the planner, or the system by name -- just answer the question as an expert reading the provided hits would."""
+Instructions:
+1. Identify the exact technologies and libraries strictly from the retrieved evidence (e.g. Next.js Pages Router or App Router, Supabase, PostgreSQL, MongoDB, Prisma, NextAuth, etc. as confirmed in package dependencies or source imports).
+2. When explaining architecture, data flow, or features, ground your answer in the concrete technical layers present in the evidence:
+   * **Frontend UI / Pages Layer**: User interaction in React components / pages, forms, client state (e.g. localStorage), and API request calls.
+   * **API Routing Layer**: Request handling, validation, and authorization in API route handlers (e.g. `pages/api/...` or `app/api/...`).
+   * **Database & Persistence Layer**: Exact database client / ORM (e.g. Supabase client in `utils/supabase.ts`, Prisma, MongoDB) and data tables/collections referenced in the source excerpts.
+   * **Authentication & Session Handling**: Real authentication mechanisms found in the source code (e.g. Supabase auth queries, token validation, or session persistence).
+3. When analyzing a specific file or endpoint:
+   * State the EXACT functions, HTTP methods, and handlers defined in the source code. NEVER invent or guess HTTP methods or libraries that do not exist in the retrieved excerpts.
+   * State the EXACT request payload parameters, database tables, and helper functions called.
+   * Describe the real logic step by step as written in the code.
+4. Reference and cite the actual files provided in the evidence using inline backtick citations (e.g. `pages/api/validateCredentials.ts`, `utils/supabase.ts`).
+5. Always be precise, direct, and grounded strictly in the provided evidence. NEVER invent boilerplate code, credentials providers, or database schemas not present in the evidence."""
 
 
 # ─── result type ─────────────────────────────────────────────────────────────
@@ -338,11 +315,102 @@ def _format_hits(
         h for h in shown if not isinstance(h, (SymbolResult, FileResult, TextHit))
     ]
 
+def _extract_context_paths(context_results: list[Any] | None) -> set[str]:
+    """Extract distinct valid file paths from context results."""
+    paths: set[str] = set()
+    if not context_results:
+        return paths
+    for cr in context_results:
+        res = getattr(cr, "result", None)
+        if not res:
+            continue
+        key_files = getattr(res, "key_files", None)
+        if isinstance(key_files, list):
+            for kf in key_files:
+                p = getattr(kf, "path", None) if not isinstance(kf, dict) else kf.get("path")
+                if p:
+                    paths.add(p)
+        key_snippets = getattr(res, "key_file_snippets", None)
+        if isinstance(key_snippets, list):
+            for ks in key_snippets:
+                p = ks.get("path") if isinstance(ks, dict) else getattr(ks, "path", None)
+                if p:
+                    paths.add(p)
+        overview = getattr(res, "overview_doc", None)
+        if overview and overview.startswith("["):
+            doc_p = overview.split("]")[0].lstrip("[")
+            if doc_p:
+                paths.add(doc_p)
+        node = getattr(res, "node", None)
+        if node:
+            p = getattr(node, "path", None) if not isinstance(node, dict) else node.get("path")
+            if p:
+                paths.add(p)
+        node_path = getattr(res, "node_path", None)
+        if node_path:
+            paths.add(node_path)
+        for n in getattr(res, "neighbors_in", []) or []:
+            p = getattr(n, "path", None) if not isinstance(n, dict) else n.get("path")
+            if p:
+                paths.add(p)
+        for n in getattr(res, "neighbors_out", []) or []:
+            p = getattr(n, "path", None) if not isinstance(n, dict) else n.get("path")
+            if p:
+                paths.add(p)
+        target = getattr(res, "target", None)
+        if target and ("/" in str(target) or any(str(target).endswith(ext) for ext in (".py", ".ts", ".tsx", ".js", ".jsx", ".md"))):
+            paths.add(str(target))
+    return paths
+
+
+def _format_hits(
+    results: list[SearchStepResult],
+    *,
+    context_results: list[Any] | None = None,
+    max_hits: int = DEFAULT_MAX_HITS,
+) -> tuple[str, list[str]]:
+    """Flatten every hit in ``results`` into one citable prompt block and the
+    grounding set of distinct file paths.
+    """
+    all_hits: list[Any] = []
+    for r in results:
+        all_hits.extend(r.hits)
+    total = len(all_hits)
+    capped = total > max_hits
+    shown = all_hits[:max_hits]
+
+    symbols: list[SymbolResult] = []
+    files: list[FileResult] = []
+    texts: list[TextHit] = []
+    other: list[Any] = []
+    for h in shown:
+        if isinstance(h, SymbolResult):
+            symbols.append(h)
+        elif isinstance(h, FileResult):
+            files.append(h)
+        elif isinstance(h, TextHit):
+            texts.append(h)
+        else:
+            other.append(h)
+
     ground_set: set[str] = set()
     for h in shown:
         p = _hit_path(h)
         if p:
             ground_set.add(p)
+    ground_set.update(_extract_context_paths(context_results))
+
+    # Add search snippets to ground set
+    search_snippets: list[dict[str, str]] = []
+    for r in results:
+        snips = getattr(r, "matched_file_snippets", None)
+        if snips and isinstance(snips, list):
+            for s in snips:
+                sp = s.get("path")
+                if sp:
+                    ground_set.add(sp)
+                    search_snippets.append(s)
+
     ground = sorted(ground_set)
 
     parts: list[str] = []
@@ -351,12 +419,26 @@ def _format_hits(
             f"((NOTE: the tools returned {total} hits in total; only the first "
             f"{max_hits} are listed below. Cite ONLY from the hits shown here.))"
         )
+
+    # Render matched file source snippets if available
+    if search_snippets:
+        parts.append("## Matched Source File Implementation Snippets:")
+        for snip in search_snippets[:3]:
+            sp = snip.get("path", "")
+            sc = snip.get("snippet", "")
+            if sp and sc:
+                parts.append(f"### `{sp}` (source excerpt):\n```\n{sc}\n```")
+
     if not (symbols or files or texts):
-        # No citable hits at all (other-only or fully empty). Still emit a block
-        # so the model has SOMETHING to ground its "nothing matched" answer on,
-        # rather than answering from nothing.
-        parts.append("(no hits were returned by any search tool)")
-        parts.append("Allowed citation paths: (none)")
+        if context_results or search_snippets:
+            parts.append("## Retrieved Repository Evidence & Context (from repository inspection):")
+            parts.append("Analyze the documentation, key files, and implementation snippets provided in the Context section below to answer the user's question.")
+        else:
+            parts.append("(no hits were returned by any search tool)")
+        parts.append(
+            "Allowed citation paths: "
+            + (", ".join(f"`{p}`" for p in ground) if ground else "(none)")
+        )
         return "\n".join(parts), ground
 
     if symbols:
@@ -396,82 +478,15 @@ def _format_hits(
     return "\n".join(parts), ground
 
 
-# ─── context block (SDD 9.3 results, the "cite with care" second block) ───────
-# Consumes ``ContextStepResult`` objects (one per executed context plan step -- the
-# structural twin of SearchStepResult but for the four context tools, SDD 9.3),
-# each wrapping a different SDD 10 result dataclass
-# (:class:`ArchitectureResult` / :class:`DependencyGraphResult` /
-# :class:`FileHistoryResult` / :class:`GitHubMetadataResult`). Unlike the
-# search-hit builders above, the Synthesizer does NOT try to format each of the
-# four context results with bespoke per-tool citation rules -- it renders them
-# RAW via ``dataclasses.asdict`` under one clearly-labeled "cite with care"
-# header, and does NOT add their paths to the grounding set.
-#
-# Why the asymmetry (search hits are citable; context results are "cite with
-# care", not added to "Allowed citation paths"):
-# * The search hits are the SDD 9.4 grounding basis by *construction* -- they are
-#   the model's source of named paths/lines (each hit was a match to the user's
-#   query, surfaced by a search tool). The context block is *additional
-#   contextual signal* (the key-files centrality, the import
-#   closures, the file history, the GitHub metadata) -- a path that appears in
-#   e.g. architecture's "key files" is NOT itself a citation the grounding rule
-#   permits, because the search tools never vouched for it as a match to the
-#   user's query; the model quoting it would be claiming a fact the search step
-#   didn't surface. So context paths stay off the grounding set, and the model
-#   is told (in the header) to use the context only to interpret or frame the
-#   search hits, not to invent citations from it.
-# * Bespoke per-tool rendering (architecture centrality vs. dependency closures
-#   vs. file history vs. GitHub metadata) is real engineering -- and OUT OF SCOPE
-#   today, because the Planner's context menu is not yet wired (CLAUDE.md), so
-#   ``context_results`` is empty in every current execution path (the demo's 3
-#   questions are all search-tool questions; the Context Agent is exercised by
-#   hand-constructed steps in its own tests/demo). When the menu lands AND this
-#   minimal renderer is exercised live, a follow-up can specialize the per-tool
-#   rendering then -- guided by real model behavior, exactly the way every other
-#   prompt decision in this stack was tuned (the same "verify, don't guess"
-#   posture the CLAUDE.md known-limitation note codifies). This helper is the
-#   narrow additive seam that follow-up plugs into.
-
-
 def _format_context_block(
-    context_results: list[ContextStepResult] | None,
+    context_results: list[Any] | None,
     *,
     max_context: int,
 ) -> str:
-    """Build the additional "Context results" block appended to the user message;
-    return ``""`` when there is nothing to render (kept by the caller as the
-    no-op branch -- a ``""`` context block means the user message is byte-
-    identical to today's search-only prompt, so the 11 verified demo/diagnostic
-    runs are preserved whenever no context steps ran).
-
-    Each rendered context result is one labeled bullet: the tool name, the
-    args actually used (so the model sees what the context query was), and the
-    tool's structured result dumped via :func:`dataclasses.asdict` as compact
-    JSON. ``ContextStepResult.result`` carries one of the four SDD 10 context
-    result dataclasses (plain fields / dataclasses of plain fields all the way
-    down), so ``asdict`` + ``json.dumps`` is total (no opaque NetworkX or ORM
-    object escapes -- the context tools serialize their own graph slices into
-    lists of dicts/edges). CRLF in any str field is folded to LF
-    (:func:`_normalize_newlines`) at the boundary where text *enters* agent
-    context, the same fix the search-hit fields get -- so a Windows repo's
-    commit subject or an architecture label can't put a raw ``\\r`` in front of
-    the model.
-
-    Two caps (both surfaced, never silent -- the project's "no silent caps"
-    posture): ``max_context`` truncates the *number* of results rendered (the
-    order is preserved; the dropped tail is named by the NOTE banner so it is
-    visible, not swallowed), and :data:`CONTEXT_RESULT_CAP` truncates each
-    per-result dump with an ellipsis so one ballooning architecture/dependency
-    result can't eat the prompt's budget.
-    """
+    """Build the Context results block appended to the user message."""
     if not context_results:
         return ""
 
-    # Normal newline-fold every str-valued field so no raw carriage return reaches
-    # the prompt (the context tools' results can carry a repo-relative path /
-    # commit subject / issue title sourced from disk or the GitHub API; same CRLF
-    # boundary-fix the search-hit fields get). Mutates the asdict copy, not the
-    # caller's dataclasses (``asdict`` returns fresh plain dicts/lists).
     def _fold_strs(obj: Any) -> Any:
         if isinstance(obj, str):
             return _normalize_newlines(obj)
@@ -482,26 +497,38 @@ def _format_context_block(
         return obj
 
     parts: list[str] = [
-        "## Context results (CONTEXTUAL only -- NOT additional citation grounds; "
-        "the citable paths remain the search-hit paths above. Use these to "
-        "understand the repo's shape/structure/history, and to FRAME or interpret "
-        "the search hits; do not invent a file/line citation that did not appear "
-        "in the search hits block.)"
+        "## Context results (structural, relational, and architectural facts from repository tools):"
     ]
     n_dropped = max(0, len(context_results) - max_context)
     for r in context_results[:max_context]:
+        res_obj = getattr(r, "result", None)
+
+        overview_doc = getattr(res_obj, "overview_doc", None) if res_obj else None
+        if overview_doc:
+            parts.append(f"### Repository Overview Documentation:\n{overview_doc}\n")
+
+        target_snip = getattr(res_obj, "target_file_snippet", None) if res_obj else None
+        node_path = getattr(res_obj, "node_path", None) if res_obj else None
+        if target_snip and node_path:
+            parts.append(f"### Target File Implementation (`{node_path}` source excerpt):\n```\n{target_snip}\n```\n")
+
+        snippets = getattr(res_obj, "key_file_snippets", None) if res_obj else None
+        if snippets and isinstance(snippets, list):
+            parts.append("### Key Implementation File Snippets:")
+            for snip in snippets:
+                sp = snip.get("path") if isinstance(snip, dict) else getattr(snip, "path", "")
+                sc = snip.get("snippet") if isinstance(snip, dict) else getattr(snip, "snippet", "")
+                if sp and sc:
+                    parts.append(f"#### `{sp}` (source excerpt):\n```\n{sc}\n```")
+
         try:
-            dumped = json.dumps(_fold_strs(asdict(r.result)), ensure_ascii=False)
+            dumped = json.dumps(_fold_strs(asdict(res_obj) if res_obj and hasattr(res_obj, "__dataclass_fields__") else res_obj), ensure_ascii=False)
         except (TypeError, ValueError):
-            # A context result that is not ``asdict``-able (a future tool returning
-            # a non-dataclass, or a field holding an unpicklable object) is shown
-            # raw rather than crashing synthesis -- the demo must never die on one
-            # bad context result. The block still renders; this result is labeled
-            # "(unserializable, shown raw)" so it's visible, not swallowed.
-            dumped = repr(r.result)
+            dumped = repr(res_obj)
         if len(dumped) > CONTEXT_RESULT_CAP:
             dumped = dumped[:CONTEXT_RESULT_CAP] + " …"
         parts.append(f"- {r.tool} (args={json.dumps(r.args, ensure_ascii=False)}) -> {dumped}")
+
     if n_dropped:
         parts.append(
             f"((NOTE: {len(context_results)} context results were returned in "
@@ -520,51 +547,31 @@ def _format_context_block(
 _CITATION_TOKEN_RE = re.compile(r"[A-Za-z0-9_.][A-Za-z0-9_./\-]*")
 
 
-def _extract_cited_file_paths(answer: str) -> list[str]:
+def _extract_cited_file_paths(
+    answer: str,
+    ground_paths: list[str] | None = None,
+) -> list[str]:
     """Heuristic extraction of the file paths the model actually NAMED in its
-    answer, in first-appearance order, deduped. This is the rough "what's
-    citable in the prose" snapshot the build task asks for -- NOT a precise
-    citation parser -- so a caller can later diff it against the grounding set
-    (:data:`SynthesizerResult.hit_file_paths`) to see whether every cited path
-    was real (and whether real hits went uncited).
-
-    Biased toward precision over recall: a missed weird citation is cheaper than
-    a flood of prose false-positives that bury the real ones. The rule:
-
-    * tokenize the answer into runs of path-legal chars
-      (:data:`_CITATION_TOKEN_RE`); surrounding markdown (backticks, parens) and
-      trailing ``:line`` references are naturally excluded because those
-      characters are not in the class.
-    * keep a token only if it *looks like a path* -- it contains a ``/`` OR ends
-      in ``.py`` -- AND contains at least one letter (drops pure-numeric ratios
-      like ``3.14/2`` from prose).
-    * strip a single trailing slash (``tests/`` -> ``tests``), then dedupe
-      preserving first-seen order.
-
-    Known imperfections, documented rather than hidden (the project's "honestly
-    weaker, clearly labeled" posture -- same as the reference-index stage's
-    name-graph-not-call-graph note): a cited directory with no extension and a
-    trailing slash like ``tests/`` becomes ``tests``, which (no slash, no
-    ``.py``) is then DROPPED, so directory-only citations are missed; and prose
-    with a slash like ``client/server`` can false-positive (mitigated, not
-    eliminated, by the letter requirement). Good enough to let a human eyeball
-    the model's citation behavior; not a citation grammar.
-    """
+    answer, in first-appearance order, deduped."""
     seen: set[str] = set()
     out: list[str] = []
+
+    # First priority: check any ground-truth path that appears in the answer text
+    if ground_paths:
+        for gp in ground_paths:
+            if gp and gp in answer and gp not in seen:
+                seen.add(gp)
+                out.append(gp)
+
     for m in _CITATION_TOKEN_RE.finditer(answer):
         tok = m.group(0)
         if not any(c.isalpha() for c in tok):
             continue
-        # Strip a trailing slash BEFORE the path-likeness gate, so a directory
-        # citation like `tests/` -> `tests` is then re-tested and dropped (no
-        # `/`, no `.py`), matching the docstring. A token like `flask/app.py/`
-        # (weird but possible) -> `flask/app.py` still passes the gate.
         if tok.endswith("/"):
             tok = tok[:-1]
         if not tok:
             continue
-        if not ("/" in tok or tok.endswith(".py")):
+        if not ("/" in tok or tok.endswith((".py", ".ts", ".tsx", ".js", ".jsx", ".md"))):
             continue
         if tok in seen:
             continue
@@ -607,24 +614,20 @@ def _chat_payload(
     (the default) disables chain-of-thought (see module docstring for the
     budget-exhaustion rationale). Top-level, NOT under ``options``.
     """
-    user_content = f"Search hits:\n{hits_block}\n\nUser question:\n{question}"
     if context_block and context_block.strip():
-        # The context block is sandwiched between the hits (the grounding basis)
-        # and the question (what the model must answer) so it reads like extra
-        # signal about the repo's shape/structure/history that frames the hits,
-        # not a competing set of citable paths. Its own header carries the
-        # "cite with care" instruction; the system prompt's grounding rule
-        # (only "Allowed citation paths" are real) is untouched, and the context
-        # block is NOT added to that grounding set.
-        user_content = (
-            f"Search hits:\n{hits_block}\n\nContext results:\n{context_block}\n"
-            f"\nUser question:\n{question}"
-        )
+        if hits_block.strip().startswith("## Retrieved Repository Evidence"):
+            user_content = f"{hits_block}\n\n{context_block}\n\nUser question:\n{question}"
+        else:
+            user_content = (
+                f"Search hits:\n{hits_block}\n\nContext results:\n{context_block}\n"
+                f"\nUser question:\n{question}"
+            )
+    else:
+        user_content = f"Search hits:\n{hits_block}\n\nUser question:\n{question}"
+
     body: dict[str, Any] = {
         "model": model,
         "stream": False,
-        # think=False: top-level (NOT under options). Disables CoT so the answer
-        # isn't budget-exhausted to empty. Same fix as planner._chat_payload.
         "think": think,
         "options": {"temperature": temperature, "num_predict": max_tokens},
         "messages": [
@@ -754,7 +757,7 @@ def synthesize(
     body) -- the same category the chain demo already catches for the Planner, so
     one ``except`` covers both stages.
     """
-    hits_block, ground = _format_hits(results, max_hits=max_hits)
+    hits_block, ground = _format_hits(results, context_results=context_results, max_hits=max_hits)
     context_block = _format_context_block(context_results, max_context=max_context)
     payload = _chat_payload(
         question,
@@ -775,7 +778,7 @@ def synthesize(
         answer=answer,
         raw_response=raw,
         hit_file_paths=ground,
-        cited_file_paths=_extract_cited_file_paths(answer),
+        cited_file_paths=_extract_cited_file_paths(answer, ground_paths=ground),
         wall_time_s=end - start,
     )
 

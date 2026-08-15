@@ -176,39 +176,74 @@ def build_file_history(
 
 def query_file_history(
     repository_id: int,
-    target: str,
-    session: Session,
+    target: str | None = None,
+    session: Session | None = None,
     *,
     recent_cap: int = DEFAULT_RECENT_CAP,
 ) -> FileHistoryResult:
-    """Return the cached git history for the file ``target`` resolves to, for
-    ``repository_id`` (SDD §10 History Search).
+    """Return the cached git history for the file ``target`` resolves to, or for
+    the entire repository if ``target`` is omitted / 'repository_root' / 'repo' / '.'
+    (SDD §10 History Search).
 
     *Live read*: resolves ``target`` to a ``file_id`` via
     :func:`app.tools._path_resolve.resolve_file_id`, reads ``files.last_modified``
     plus the commits touching the file (``commits`` joined through the
     ``file_commits`` join table, SDD §11), and hands them to
     :func:`build_file_history`. Injected ``Session``, owns no transaction.
-
-    An unresolvable ``target`` yields a clear-empty :class:`FileHistoryResult`.
-    ``recent_cap`` is int-coerced + floored at 0 (a stray ``"10"`` survives; a
-    negative clamps to 0 = "no recent commits listed", which still leaves
-    ``top_contributors`` + ``last_modified`` intact)."""
+    """
     try:
         cap = max(0, int(recent_cap))
     except (TypeError, ValueError):
         cap = DEFAULT_RECENT_CAP
 
+    if session is None:
+        return FileHistoryResult(file_path=None, last_modified=None)
+
+    target_clean = str(target or "").strip().lower()
+    is_repo_wide = not target or target_clean in ("", ".", "repository_root", "repo", "all", "root", "*", "whole_repo")
+
+    if is_repo_wide:
+        commit_rows = (
+            session.execute(
+                sa.select(Commit.hash, Commit.message, Commit.date, Commit.author)
+                .where(Commit.repository_id == repository_id)
+                .order_by(Commit.date.desc())
+            )
+            .all()
+        )
+        commits = [(h, msg, d, a) for (h, msg, d, a) in commit_rows]
+        return build_file_history(
+            file_path="repository_root",
+            last_modified=commits[0][2] if commits else None,
+            commits=commits,
+            recent_cap=cap,
+        )
+
     file_id = resolve_file_id(repository_id, target, session)
     if file_id is None:
+        # If target has "repo" or "root" in its name or is unresolvable generic query, fallback to repo-wide
+        if "repo" in target_clean or "root" in target_clean or target_clean in ("git", "project"):
+            commit_rows = (
+                session.execute(
+                    sa.select(Commit.hash, Commit.message, Commit.date, Commit.author)
+                    .where(Commit.repository_id == repository_id)
+                    .order_by(Commit.date.desc())
+                )
+                .all()
+            )
+            commits = [(h, msg, d, a) for (h, msg, d, a) in commit_rows]
+            return build_file_history(
+                file_path="repository_root",
+                last_modified=commits[0][2] if commits else None,
+                commits=commits,
+                recent_cap=cap,
+            )
         return FileHistoryResult(file_path=None, last_modified=None)
 
     row = session.execute(
         sa.select(File.path, File.last_modified).where(File.id == file_id)
     ).first()
     if row is None:
-        # file_id resolved but no files row persists (swept between resolve and
-        # read) — clear empty, same stale-row posture as the graph tools.
         return FileHistoryResult(file_path=None, last_modified=None)
     file_path, last_modified = row
 
@@ -217,6 +252,7 @@ def query_file_history(
             sa.select(Commit.hash, Commit.message, Commit.date, Commit.author)
             .join(file_commits, file_commits.c.commit_id == Commit.id)
             .where(file_commits.c.file_id == file_id)
+            .order_by(Commit.date.desc())
         )
         .all()
     )

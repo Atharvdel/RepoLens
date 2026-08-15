@@ -232,7 +232,20 @@ def parse_imports(path: Path | str) -> list[ParsedImport]:
     a syntactically broken file still yields a best-effort tree, extracted
     as-is. Dedicated parse-error reporting is a later pipeline-hardening step.
     """
-    src = Path(path).read_bytes()
+    p = Path(path)
+    suffix = p.suffix.lower()
+    if suffix in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}:
+        from app.indexing.ts_js_parser import parse_ts_js_file_imports
+        raw_imports = parse_ts_js_file_imports(p)
+        ts_seen: dict[tuple[int, str], ParsedImport] = {}
+        for raw in raw_imports:
+            lvl = getattr(raw, "level", (1 if raw.is_relative else 0))
+            key = (lvl, raw.module)
+            if key not in ts_seen:
+                ts_seen[key] = ParsedImport(target=raw.module, level=lvl, line=raw.line_number)
+        return list(ts_seen.values())
+
+    src = p.read_bytes()
     language = Language(tsp.language())
     parser = Parser(language)
     tree = parser.parse(src)
@@ -419,13 +432,36 @@ class ImportResolver:
     def resolve(self, source_path: str, imp: ParsedImport) -> int | None:
         """Resolve ``imp`` (seen from the file at ``source_path``) to a
         ``file_id``, or ``None`` if it cannot be confidently mapped.
-
-        ``source_path`` is the importing file's POSIX-rel path (the same form
-        stored in the ``files`` table) and is only consulted for *relative*
-        imports — absolute imports resolve purely from the importable-name map.
         """
         if imp.level == 0:
             return self._importable_to_id.get(imp.target)
+
+        # Root-relative alias (@/ or ~/) in JS/TS/Next.js projects
+        if imp.level == -1:
+            root_prefix = source_path.split("/", 1)[0] if "/" in source_path else ""
+            target_path = imp.target
+            if target_path.startswith("@/"):
+                target_path = target_path[2:]
+            elif target_path.startswith("~/"):
+                target_path = target_path[2:]
+            cand = f"{root_prefix}/{target_path}" if root_prefix else target_path
+            candidates = [
+                f"{cand}.ts",
+                f"{cand}.tsx",
+                f"{cand}.js",
+                f"{cand}.jsx",
+                f"{cand}/index.ts",
+                f"{cand}/index.tsx",
+                f"{cand}/index.js",
+                f"{cand}/index.jsx",
+                f"{cand}.py",
+                cand,
+            ]
+            for c in candidates:
+                fid = self._path_to_id.get(c)
+                if fid is not None:
+                    return fid
+            return None
 
         # Relative: path-space resolution against the source file's own directory.
         src_dir = source_path.rsplit("/", 1)[0] if "/" in source_path else ""
@@ -440,14 +476,32 @@ class ImportResolver:
             else:
                 base = ""  # the final step from a top-level dir up to root ("")
 
-        target_path = imp.target.replace(".", "/")
+        target_path = imp.target
+        if target_path.startswith("./") or target_path.startswith("../"):
+            clean_parts = [p for p in target_path.split("/") if p not in {".", ".."}]
+            target_path = "/".join(clean_parts)
+        elif "." in target_path and not target_path.startswith("/") and not any(target_path.endswith(ext) for ext in [".js", ".ts", ".jsx", ".tsx", ".py"]):
+            target_path = target_path.replace(".", "/")
+
         cand = f"{base}/{target_path}" if base else target_path
-        try_file = f"{cand}.py"
-        fid = self._path_to_id.get(try_file)
-        if fid is not None:
-            return fid
-        # The tail may name a package (its __init__.py) rather than a module.
-        return self._path_to_id.get(f"{cand}/__init__.py")
+        candidates = [
+            f"{cand}.py",
+            f"{cand}/__init__.py",
+            f"{cand}.ts",
+            f"{cand}.tsx",
+            f"{cand}.js",
+            f"{cand}.jsx",
+            f"{cand}/index.ts",
+            f"{cand}/index.tsx",
+            f"{cand}/index.js",
+            f"{cand}/index.jsx",
+            cand,
+        ]
+        for c in candidates:
+            fid = self._path_to_id.get(c)
+            if fid is not None:
+                return fid
+        return None
 
     def importable_name(self, posix_path: str) -> str | None:
         """Expose :meth:`_importable_name` for diagnostics / tests."""

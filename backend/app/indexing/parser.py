@@ -229,7 +229,13 @@ def parse_file(path: Path | str) -> list[ParsedSymbol]:
     handling as a later phase); this module does not special-case ``ERROR``
     nodes.
     """
-    src = Path(path).read_bytes()
+    p = Path(path)
+    suffix = p.suffix.lower()
+    if suffix in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}:
+        from app.indexing.ts_js_parser import parse_ts_js_file_symbols
+        return parse_ts_js_file_symbols(p)
+
+    src = p.read_bytes()
     language = Language(tsp.language())
     parser = Parser(language)
     tree = parser.parse(src)

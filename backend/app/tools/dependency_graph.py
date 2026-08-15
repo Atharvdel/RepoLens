@@ -61,8 +61,7 @@ small and the read is the live boundary (mirroring the duplicated
 :func:`_ilike_contains` posture — a copy per self-contained module beats a
 shared load that couples two independent tools' SQL to one owner).
 """
-from __future__ import annotations
-
+import os
 from dataclasses import dataclass, field
 from typing import Iterable
 
@@ -70,7 +69,7 @@ import networkx as nx
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
-from app.models import Edge, File
+from app.models import Edge, File, Repository
 from app.tools._path_resolve import resolve_file_id
 
 # Default neighborhood depth. SDD §10 Dependency Graph Builder names the shape
@@ -107,29 +106,14 @@ class GraphNode:
 
 @dataclass
 class DependencyGraphResult:
-    """The SDD §10 Dependency Graph output shape, populated by BFS.
-
-    Every field is a plain JSON type (the SDD §10 "structured JSON, never free
-    text" contract, mirrored from :class:`app.tools.symbol_search.SymbolResult`):
-    ``node_path`` and the per-node ``path`` fields are POSIX-rel strings (or
-    ``None``), ``depth`` is the int actually walked, and ``neighbors_in`` /
-    ``neighbors_out`` are lists of :class:`GraphNode`. ``json.dumps(
-    dataclasses.asdict(result))`` works straight into a ``tool_trace`` row
-    (SDD §11) or the Synthesizer's context.
-
-    ``node_path`` is ``None`` when ``query_dependency_graph`` was handed an
-    unresolvable ``target`` (an empty result is a valid answer, not an error —
-    the same contract the search tools hold); in that case both neighbor lists
-    are empty and ``node_id`` is ``None``. This is how the Context Agent
-    surfaces "Planner asked about a file we can't map" — as a clear empty result,
-    not a crash.
-    """
+    """The SDD §10 Dependency Graph output shape, populated by BFS."""
 
     node_id: int | None
     node_path: str | None
     depth: int
     neighbors_in: list[GraphNode] = field(default_factory=list)
     neighbors_out: list[GraphNode] = field(default_factory=list)
+    target_file_snippet: str | None = None
 
 
 # ─── pure core (no DB) ───────────────────────────────────────────────────────
@@ -284,7 +268,24 @@ def query_dependency_graph(
         return DependencyGraphResult(
             node_id=None, node_path=None, depth=depth_int
         )
-    return build_dependency_subgraph(edges, path_by_id, node_id, depth_int)
+    res = build_dependency_subgraph(edges, path_by_id, node_id, depth_int)
+    if res.node_path:
+        from app.tools._path_resolve import resolve_repo_root
+        repo_root = resolve_repo_root(repository_id, session)
+        if repo_root:
+            full_p = os.path.join(repo_root, res.node_path)
+            if not os.path.exists(full_p) and "/" in res.node_path:
+                alt_p = os.path.join(repo_root, res.node_path.split("/", 1)[1])
+                if os.path.exists(alt_p):
+                    full_p = alt_p
+            if os.path.exists(full_p) and os.path.isfile(full_p):
+                try:
+                    with open(full_p, "r", encoding="utf-8", errors="ignore") as f:
+                        lines = [f.readline() for _ in range(75)]
+                    res.target_file_snippet = "".join(lines).strip()
+                except Exception:
+                    pass
+    return res
 
 
 __all__ = [

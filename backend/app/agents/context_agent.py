@@ -117,7 +117,7 @@ CONTEXT_TOOLS: dict[str, tuple[Callable[..., Any], frozenset[str], frozenset[str
     "architecture": (query_architecture, frozenset(), frozenset({"target", "top_k", "radius"})),
     # Dependency Graph Query: `target` required; `depth` optional.
     "dependency_graph": (query_dependency_graph, frozenset({"target"}), frozenset({"depth"})),
-    # History Search: `target` required (a file path or module name); `recent_cap` optional.
+    # History Search: `target` required (a file path, module name, or "repository_root"); `recent_cap` optional.
     "file_history": (query_file_history, frozenset({"target"}), frozenset({"recent_cap"})),
     # GitHub Metadata Loader: `target` optional (whole-repo when absent); no other knobs.
     "github_metadata": (query_github_metadata, frozenset(), frozenset({"target"})),

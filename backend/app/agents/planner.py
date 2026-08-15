@@ -1,4 +1,4 @@
-﻿"""Planner agent for the RepoLens agent layer (SDD Â§9.1).
+"""Planner agent for the RepoLens agent layer (SDD Â§9.1).
 
 The first agent, built **standalone before LangGraph** is wired (SDD Â§15): given a
 user question about a repo and a description of the available tools, ask the local
@@ -86,10 +86,29 @@ DEFAULT_TIMEOUT: float = float(os.getenv("OLLAMA_TIMEOUT", "60"))
 # query). ``repository_id`` and the injected ``session`` are orchestrator concerns,
 # never the model's, so they are NOT listed here (SDD Â§9.1's example ``args`` carries
 # only the user-relevant arg, no plumbing).
+KNOWN_SEARCH_TOOLS: frozenset[str] = frozenset({"search_symbols", "search_files", "search_text"})
+KNOWN_CONTEXT_TOOLS: frozenset[str] = frozenset({"architecture", "dependency_graph", "file_history", "github_metadata"})
+
 KNOWN_TOOLS: dict[str, frozenset[str]] = {
+    # SEARCH tools (agent "search") -- all require `query`.
     "search_symbols": frozenset({"query"}),
     "search_files": frozenset({"query"}),
     "search_text": frozenset({"query"}),
+    # CONTEXT tools (agent "context") -- the SDD §9.3 / §10 set the Context
+    # Agent (app.agents.context_agent.CONTEXT_TOOLS) dispatches. Required-arg
+    # sets MIRROR the dispatcher's exactly, so a plan step the Planner emits is
+    # dispatchable as-is and the two registries never drift (the convergence the
+    # Context Agent's module docstring called out for this follow-up).
+    # Identifier-keyed tools (dependency_graph / file_history) REQUIRE `target`;
+    # the two whole-repo-capable tools (architecture / github_metadata) make it
+    # OPTIONAL (absent `target` == whole repo). `target` is a file path OR a
+    # dotted module name (the tools' resolver handles both) -- chosen over SDD
+    # §9.1's example `"file"` name as the honest superset; the dispatcher uses
+    # `target` throughout, so no `"file"` alias is needed on the dispatch side.
+    "architecture": frozenset(),
+    "dependency_graph": frozenset({"target"}),
+    "file_history": frozenset({"target"}),
+    "github_metadata": frozenset(),
 }
 # Optional args per tool â€” may appear in ``args`` but aren't required. Surfaced as a
 # set so the validator can flag an *unexpected* arg key (one in neither required nor
@@ -98,6 +117,17 @@ OPTIONAL_TOOL_ARGS: dict[str, frozenset[str]] = {
     "search_symbols": frozenset({"kind"}),
     "search_files": frozenset(),
     "search_text": frozenset({"regex"}),
+    # CONTEXT tools' optional knobs -- mirror context_agent.CONTEXT_TOOLS'
+    # optional sets exactly (the convergence: a single source of truth for what
+    # the Planner may emit == what the dispatcher forwards into the tool).
+    # `target` is listed OPTIONAL here for the two whole-repo-capable tools
+    # (architecture / github_metadata); the dispatcher pulls `target` out of
+    # `args` and passes it as the second POSITIONAL arg (never a kwarg) -- so
+    # `_forward_kwargs` forwarding mirrors the search tools' `query` handling.
+    "architecture": frozenset({"target", "top_k", "radius"}),
+    "dependency_graph": frozenset({"depth"}),
+    "file_history": frozenset({"recent_cap"}),
+    "github_metadata": frozenset({"target"}),
 }
 
 # Default tool catalog prose handed to the model â€” describes purpose + signature +
@@ -105,7 +135,9 @@ OPTIONAL_TOOL_ARGS: dict[str, frozenset[str]] = {
 # demo hard-codes the same set rather than reading app.tools, to keep the Planner
 # standalone (no SQLAlchemy import to read tool metadata, and the names must stay
 # in lock-step with KNOWN_TOOLS above).
-DEFAULT_TOOLS_DESCRIPTION = """You have exactly three search tools. Pick tool(s) and arguments for each step. You do NOT know the repository_id or any session â€” those are injected by the system automatically; NEVER include them in args.
+DEFAULT_TOOLS_DESCRIPTION = """You choose which tool(s) the RepoLens system runs for a question about a repository. There are TWO agent roles, each with its own toolset. For each step, pick the agent role, the tool, and its arguments. You do NOT know the repository_id or any session -- those are injected by the system automatically; NEVER include them in args.
+
+SET A -- SEARCH tools. Set "agent": "search" for these. Use search tools to FIND things by name, by path, or by free text.
 
 1. search_symbols
    Purpose: find a class, function, method, or variable BY NAME in the indexed symbol table.
@@ -121,20 +153,64 @@ DEFAULT_TOOLS_DESCRIPTION = """You have exactly three search tools. Pick tool(s)
      - query  (REQUIRED, string): a filename or path fragment. Case-insensitive substring match against the file path. e.g. "app.py", "routes", "session".
 
 3. search_text
-   Purpose: search for FREE TEXT across the repo's Python source â€” matches anywhere in a line: code, comments, string literals. Literal match by default (not a regex, not whole-word).
-   Use when: the question asks "what files mention/reference/talk about X", "where is the phrase X used", or you are looking for a concept/phrase rather than a symbol name.
+   Purpose: search for FREE TEXT across the repo's source code (.py, .ts, .tsx, .js, .jsx, .json, .md) -- matches anywhere in a line: code, comments, string literals. Case-insensitive substring match.
+   Use when: the question asks "what files mention/reference/talk about X", "where is the phrase X used", "how is feature X implemented", or you are looking for a concept/keyword (e.g. "auth", "session", "login", "jwt", "database", "route").
    args:
-     - query  (REQUIRED, string): the text to search for. e.g. "url rule", "before_request", "session".
+     - query  (REQUIRED, string): the text or keyword to search for (e.g. "auth", "session", "user", "api").
      - regex  (OPTIONAL, boolean): set true only if the query should be treated as a regular expression. Default false.
+
+SET B -- CONTEXT tools. Set "agent": "context" for these. Use context tools for STRUCTURAL, RELATIONAL, or HISTORICAL questions about files: how a file relates to other files, the repo's overall layout, or a single file's git history. Do NOT use context tools to find where a symbol is defined (use search_symbols) or to find files that mention a phrase (use search_text).
+
+4. architecture
+   Purpose: the repo's high-level STRUCTURE -- its module/package breakdown, the most depended-on ("key") files by degree centrality, tech stack, documentation, and key file source excerpts. With NO target: a whole-repo overview. With a target: the structure in the immediate region around that one file/module.
+   Use when: the question asks "what is the high-level architecture", "how is this codebase organized", "what are the main modules/packages", "what are the key/central files", "what does this repo do", "explain the data flow / pipeline / system architecture", "how does data move from UI/frontend to backend/database", or "give me an overview of the project structure".
+   args:
+     - target  (OPTIONAL, string): a file path or dotted module name to focus the view around. Omit for the whole-repo overview.
+     - top_k   (OPTIONAL, integer): how many "key files" to surface. Default 10.
+     - radius  (OPTIONAL, integer): hop radius of the focused view around the target. Default 2. (Whole-repo view ignores this.)
+
+5. dependency_graph
+   Purpose: the precise DEPENDENCY NEIGHBORHOOD of ONE file/module -- the files it imports (forward / out) and the files that import it (backward / in), up to N hops.
+   Use when: the question asks "what does file X depend on / import", "what imports / depends on file X", "what are the dependencies of X", or "what is the dependency graph/neighborhood of X". Prefer this over architecture when the question is about a SINGLE specific file's dependents/dependencies; prefer architecture for a whole-repo or a region overview.
+   args:
+     - target  (REQUIRED, string): the file path or dotted module name whose dependency neighborhood you want.
+     - depth   (OPTIONAL, integer): number of import hops to walk. 1 = direct imports only (default); 2 = transitive two hops out and in.
+
+6. file_history
+   Purpose: the cached GIT HISTORY of one file -- last modified time, top contributors, recent commits touching it.
+   Use when: the question asks "what is the git history of file X", "who contributed to X", "when was X last modified", or "recent commits touching X". Requires a specific file.
+   args:
+     - target      (REQUIRED, string): the file path or dotted module name to get history for.
+     - recent_cap  (OPTIONAL, integer): max number of recent commits to list. Default 10.
+
+7. github_metadata
+   Purpose: cached GitHub issues and pull requests for the repo, optionally restricted to those linked to a given file.
+   Use when: the question asks "what GitHub issues/PRs relate to this repo", "link issues to file X", or "show open/closed issues and PRs". With NO target: all cached issues/PRs; with a target: only those linked to that file.
+   args:
+     - target  (OPTIONAL, string): a file path to filter issues/PRs by those linked to it. Omit for the whole repo.
+
+Disambiguating guidance -- pick the agent+tool that matches the question's intent:
+- "Explain data flow / pipeline / system architecture / how UI talks to database / what does the repo do / key modules" -> architecture (agent "context", no target). NEVER use search_text for broad architectural or data flow questions.
+- "Where is X defined?" / "find the class/function named X" -> search_symbols (agent "search").
+- "Which file contains X?" / "find the file whose path has X" -> search_files (agent "search").
+- "How is feature X implemented?" / "How does authentication/session/routing work?" -> search_text (query="auth" or "session") or search_files (query="auth").
+- "What files mention/contain the phrase X?" -> search_text (agent "search").
+- "What does file X depend on?" / "what depends on file X?" / "dependency neighborhood of X" -> dependency_graph (agent "context", target = X).
+- "Git history / who contributed to / recent commits touching file X" -> file_history (agent "context", target = X).
+- "GitHub issues/PRs for the repo, or linked to file X" -> github_metadata (agent "context", target optional).
 
 Output rules:
 - Emit ONLY a JSON object, no markdown, no code fences, no prose before or after.
 - The object has a single key "steps": a list (possibly empty) of steps, in execution order.
-- Each step is {"agent": "search", "tool": <one of the three tool names above>, "args": {... only the user args above ...}}.
-- Prefer the single most-targeted tool. Use multiple steps only when the question clearly needs more than one search.
-- If the question is unanswerable with these three tools, emit {"steps": []}.
+- Each step is {"agent": <"search" or "context">, "tool": <one of the tool names above>, "args": {... only the user args above ...}}.
+- The "agent" must match the tool's set: "search" for search_symbols/search_files/search_text; "context" for architecture/dependency_graph/file_history/github_metadata.
+- "target" (where required or used) may be a file path (e.g. "src/flask/app.py", "app.py") OR a dotted module name (e.g. "flask.app", "flask.blueprints"); the system resolves it both ways.
+- Prefer the single most-targeted tool. Use multiple steps only when the question clearly needs more than one tool.
+- If the question is unanswerable with these tools, emit {"steps": []}.
 
-Example output:
+Example output (a context question):
+{"steps": [{"agent": "context", "tool": "dependency_graph", "args": {"target": "flask.app", "depth": 1}}]}
+Example output (a search question):
 {"steps": [{"agent": "search", "tool": "search_symbols", "args": {"query": "Blueprint", "kind": "class"}}]}
 """
 

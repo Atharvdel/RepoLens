@@ -219,12 +219,13 @@ def test_search_tools_registry_matches_planner_known_tools():
     so a plan the Planner produces is dispatchable as-is, and the two modules
     can't drift (a tool added to one but not the other would be a silent
     dead-plan-step bug)."""
-    from app.agents.planner import KNOWN_TOOLS
+    from app.agents.planner import KNOWN_SEARCH_TOOLS, KNOWN_TOOLS
 
-    assert set(SEARCH_TOOLS) == set(KNOWN_TOOLS), (
+    assert set(SEARCH_TOOLS) == set(KNOWN_SEARCH_TOOLS), (
         set(SEARCH_TOOLS),
-        set(KNOWN_TOOLS),
+        set(KNOWN_SEARCH_TOOLS),
     )
+    assert set(SEARCH_TOOLS).issubset(set(KNOWN_TOOLS))
     assert set(SEARCH_TOOLS) == {"search_symbols", "search_files", "search_text"}
 
 

@@ -148,6 +148,8 @@ class ArchitectureResult:
     modules: list[ModuleView] = field(default_factory=list)
     key_files: list[KeyFile] = field(default_factory=list)
     edges: list[EdgeView] = field(default_factory=list)
+    overview_doc: str | None = None
+    key_file_snippets: list[dict[str, Any]] = field(default_factory=list)
 
 
 # ─── pure core (no DB) ───────────────────────────────────────────────────────
@@ -383,19 +385,73 @@ def query_architecture(
     edges, path_by_id = _load_internal_import_edges(repository_id, session)
     target_s = (target or "").strip()
     if not target_s:
-        return build_architecture_map(
+        result = build_architecture_map(
             edges, path_by_id, top_k=_coerce_int(top_k, DEFAULT_TOP_K, 1)
         )
-    focus = resolve_file_id(repository_id, target_s, session)
-    if focus is None:
-        return ArchitectureResult(scope="file", focus_path=None)
-    return build_architecture_map(
-        edges,
-        path_by_id,
-        focus_node_id=focus,
-        radius=_coerce_int(radius, DEFAULT_FOCUS_RADIUS, 0),
-        top_k=_coerce_int(top_k, DEFAULT_TOP_K, 1),
-    )
+    else:
+        focus = resolve_file_id(repository_id, target_s, session)
+        if focus is None:
+            return ArchitectureResult(scope="file", focus_path=None)
+        result = build_architecture_map(
+            edges,
+            path_by_id,
+            focus_node_id=focus,
+            radius=_coerce_int(radius, DEFAULT_FOCUS_RADIUS, 0),
+            top_k=_coerce_int(top_k, DEFAULT_TOP_K, 1),
+        )
+
+    # 1. Fetch README / documentation for overview context
+    from pathlib import Path
+    from app.models.document import Document
+    from app.models.repository import Repository
+
+    doc_row = session.execute(
+        sa.select(Document.path, Document.content)
+        .where(Document.repository_id == repository_id)
+        .order_by(
+            sa.case(
+                (Document.path.ilike("%readme%"), 1),
+                (Document.path.ilike("%overview%"), 2),
+                else_=3,
+            )
+        )
+        .limit(1)
+    ).first()
+    if doc_row:
+        doc_path, doc_content = doc_row
+        result.overview_doc = f"[{doc_path}]:\n{doc_content[:2000]}"
+
+    # 2. Fetch code snippets for top central key files
+    from app.tools._path_resolve import resolve_repo_root
+    repo_root = resolve_repo_root(repository_id, session)
+
+    if repo_root and repo_root.is_dir():
+        snippets = []
+        paths_to_read = []
+        if result.focus_path:
+            paths_to_read.append(result.focus_path)
+        for kf in result.key_files:
+            if kf.path and kf.path not in paths_to_read:
+                paths_to_read.append(kf.path)
+
+        for p in paths_to_read[:5]:
+            full_path = repo_root / p
+            if not full_path.is_file() and "/" in p:
+                alt = repo_root / p.split("/", 1)[1]
+                if alt.is_file():
+                    full_path = alt
+            if full_path.is_file():
+                try:
+                    with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                        lines = [f.readline() for _ in range(75)]
+                        snippet = "".join(lines).strip()
+                        if snippet:
+                            snippets.append({"path": p, "snippet": snippet})
+                except Exception:
+                    pass
+        result.key_file_snippets = snippets
+
+    return result
 
 
 def _coerce_int(value, default: int, floor: int) -> int:

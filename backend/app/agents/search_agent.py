@@ -70,12 +70,14 @@ weak-model JSON habit) is coerced to bool before forwarding.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from sqlalchemy.orm import Session
 
 from app.agents.planner import OPTIONAL_TOOL_ARGS
+from app.models.repository import Repository
 from app.tools.file_search import FileResult, search_files
 from app.tools.symbol_search import SymbolResult, search_symbols
 from app.tools.text_search import TextHit, search_text
@@ -92,6 +94,15 @@ SEARCH_TOOLS: dict[str, tuple[Callable[..., Any], frozenset[str]]] = {
     "search_symbols": (search_symbols, frozenset(OPTIONAL_TOOL_ARGS["search_symbols"])),
     "search_files": (search_files, frozenset(OPTIONAL_TOOL_ARGS["search_files"])),
     "search_text": (search_text, frozenset(OPTIONAL_TOOL_ARGS["search_text"])),
+}
+
+KEYWORD_ALIASES: dict[str, str] = {
+    "authentication": "auth",
+    "authorization": "auth",
+    "database": "db",
+    "configuration": "config",
+    "repository": "repo",
+    "middleware": "middle",
 }
 
 
@@ -122,6 +133,7 @@ class SearchStepResult:
     repository_id: int
     args: dict[str, Any] = field(default_factory=dict)
     hits: list[Any] = field(default_factory=list)
+    matched_file_snippets: list[dict[str, str]] = field(default_factory=list)
 
 
 # ─── errors ──────────────────────────────────────────────────────────────────
@@ -187,6 +199,57 @@ def _forward_kwargs(
         if key in args:
             fwd[key] = _coerce_regex(args[key]) if key == "regex" else args[key]
     return fwd
+
+
+def _extract_file_snippets(
+    hits: list[Any],
+    repository_id: int,
+    session: Session,
+    max_files: int = 3,
+    max_lines: int = 45,
+) -> list[dict[str, str]]:
+    """Extract initial source code snippets from distinct files matched in hits."""
+    if not hits:
+        return []
+
+    paths: list[str] = []
+    for h in hits:
+        p = getattr(h, "file", None) or getattr(h, "path", None)
+        if p and p not in paths:
+            # Skip package-lock.json or massive bundles
+            if not any(ign in p.lower() for ign in ["package-lock", "yarn.lock", ".min.", "chunk"]):
+                paths.append(p)
+
+    if not paths:
+        return []
+
+    from app.tools._path_resolve import resolve_repo_root
+    repo_root = resolve_repo_root(repository_id, session)
+    if not repo_root or not os.path.exists(repo_root):
+        return []
+
+    snippets: list[dict[str, str]] = []
+    for p in paths[:max_files]:
+        # Try direct path
+        full_p = os.path.join(repo_root, p)
+        if not os.path.exists(full_p):
+            parts = p.split("/", 1)
+            if len(parts) > 1:
+                alt_p = os.path.join(repo_root, parts[1])
+                if os.path.exists(alt_p):
+                    full_p = alt_p
+
+        if os.path.exists(full_p) and os.path.isfile(full_p):
+            try:
+                with open(full_p, "r", encoding="utf-8", errors="ignore") as f:
+                    lines = f.readlines()
+                snippet = "".join(lines[:max_lines])
+                if snippet.strip():
+                    snippets.append({"path": p, "snippet": snippet})
+            except Exception:
+                pass
+
+    return snippets
 
 
 def build_search_step_result(
@@ -260,13 +323,38 @@ def build_search_step_result(
             f"{step!r}"
         ) from exc
 
-    hits = tool_fn(repository_id, query, session, **fwd)
+    raw_hits = tool_fn(repository_id, query, session, **fwd)
+    hits = list(raw_hits)
+
+    # Keyword alias & tokenized fallback if zero hits
+    if not hits and isinstance(query, str):
+        q_clean = query.strip().lower()
+        alias = KEYWORD_ALIASES.get(q_clean)
+        if alias and alias != q_clean:
+            alias_hits = tool_fn(repository_id, alias, session, **fwd)
+            if alias_hits:
+                hits = list(alias_hits)
+
+        # Multi-word compound query fallback (e.g. "authentication session authorization" -> ["auth", "session"])
+        if not hits and " " in q_clean:
+            words = [w.strip() for w in q_clean.split() if len(w.strip()) >= 3]
+            terms = list(dict.fromkeys([KEYWORD_ALIASES.get(w, w) for w in words]))
+            for term in terms:
+                term_hits = tool_fn(repository_id, term, session, **fwd)
+                if term_hits:
+                    hits.extend(term_hits)
+                    if len(hits) >= 25:
+                        break
+
+    # Extract source snippets for matched files
+    snippets = _extract_file_snippets(hits, repository_id, session)
 
     return SearchStepResult(
         tool=tool_name,
         repository_id=repository_id,
         args={"query": query, **fwd},
         hits=list(hits),
+        matched_file_snippets=snippets,
     )
 
 

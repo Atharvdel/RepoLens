@@ -32,3 +32,13 @@ class Base(DeclarativeBase):
     """Shared declarative base for all ORM models (SDD §11)."""
 
     pass
+
+
+def get_session():
+    """FastAPI dependency yielding an isolated SQLAlchemy Session per request."""
+    session = SessionLocal()
+    try:
+        yield session
+    finally:
+        session.close()
+

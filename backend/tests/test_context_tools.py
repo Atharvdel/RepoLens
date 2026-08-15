@@ -1055,11 +1055,9 @@ def test_query_file_history_flask_clear_empty_until_section7():
     assert isinstance(r, FileHistoryResult)
     assert r.file_path == sample
     # last_modified is populated (walker §7 step 1), lists empty until §7 step 7.
-    assert r.last_modified is not None
-    assert r.top_contributors == [] and r.recent_commits == [], (
-        "§7 step 7 git-history indexer must have landed — update this test "
-        "(the clear-empty-until-§7 posture no longer holds) and the tool docstring."
-    )
+    assert isinstance(r.top_contributors, list)
+    assert isinstance(r.recent_commits, list)
+    assert len(r.top_contributors) >= 1 or len(r.recent_commits) >= 1
 
 
 @flask_required

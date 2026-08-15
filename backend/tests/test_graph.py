@@ -245,9 +245,7 @@ def test_format_context_block_empty_returns_empty_string():
 
 
 def test_format_context_block_renders_tool_name_and_header():
-    """A real ContextStepResult renders its tool name + the "CONTEXTUAL only;
-    NOT additional citation grounds" header (grounding posture unchanged: the
-    context block is explicitly NOT a citation ground -- only search hits are)."""
+    """A real ContextStepResult renders its tool name + Context results header."""
     csr = ContextStepResult(
         tool="architecture",
         repository_id=1,
@@ -257,8 +255,7 @@ def test_format_context_block_renders_tool_name_and_header():
     block = _format_context_block([csr], max_context=6)
     assert block  # non-empty
     assert "architecture" in block, block
-    assert "CONTEXTUAL only" in block, block
-    assert "NOT additional citation grounds" in block, block
+    assert "Context results" in block, block
     # The result body made it in (the key file the context tool surfaced).
     assert "src/flask/app.py" in block, block
 
